@@ -458,6 +458,9 @@ static inline uint8_t _mdns_append_type(uint8_t * packet, uint16_t * index, uint
     } else if (type == MDNS_ANSWER_AAAA) {
         _mdns_append_u16(packet, index, MDNS_TYPE_AAAA);
         _mdns_append_u16(packet, index, mdns_class);
+    } else if (type == MDNS_ANSWER_NSEC) {
+        _mdns_append_u16(packet, index, MDNS_TYPE_NSEC);
+        _mdns_append_u16(packet, index, mdns_class);
     } else {
         return 0;
     }
@@ -885,6 +888,88 @@ static uint16_t _mdns_append_a_record(uint8_t * packet, uint16_t * index, const 
     return record_length;
 }
 
+/**
+ * @brief  appends negative-response NSEC record for the host to a packet, incrementing the index
+ *
+ * @param  packet       MDNS packet
+ * @param  index        offset in the packet
+ * @param  hostname     the hostname the record makes an assertion about
+ * @param  got_a        true if an A record exists for the hostname
+ * @param  got_aaaa     true if an AAAA record exists for the hostname
+ *
+ * @return length of added data: 0 on error or length on success
+ */
+static uint16_t _mdns_append_host_nsec_record(uint8_t * packet, uint16_t * index, const char * hostname, bool got_a, bool got_aaaa, bool flush)
+{
+    const char * str[2];
+    uint16_t record_length = 0;
+    uint8_t part_length;
+
+    str[0] = hostname;
+    str[1] = MDNS_DEFAULT_DOMAIN;
+
+    if (_str_null_or_empty(str[0]) || (!got_a && !got_aaaa)) {
+        return 0;
+    }
+
+    part_length = _mdns_append_fqdn(packet, index, str, 2, MDNS_MAX_PACKET_SIZE);
+    if (!part_length) {
+        return 0;
+    }
+    record_length += part_length;
+
+    part_length = _mdns_append_type(packet, index, MDNS_ANSWER_NSEC, flush, MDNS_ANSWER_A_TTL);
+    if (!part_length) {
+        return 0;
+    }
+    record_length += part_length;
+
+    uint16_t data_len_location = *index - 2;
+    uint16_t data_length = 0;
+
+    /* RDATA is the next domain name - our own host name, written uncompressed for widest
+     * querier compatibility - followed by the type bitmap. The bitmap lists exactly the
+     * address record types that exist for the name, which asserts that every other type
+     * (e.g. AAAA when IPv6 is unavailable) does not exist, see RFC 6762 section 6.1 and
+     * the bitmap encoding in RFC 4034 section 4.1.2 */
+    part_length = _mdns_append_string(packet, index, str[0]);
+    if (!part_length) {
+        return 0;
+    }
+    data_length += part_length;
+    part_length = _mdns_append_string(packet, index, str[1]);
+    if (!part_length) {
+        return 0;
+    }
+    data_length += part_length;
+    if (!_mdns_append_u8(packet, index, 0)) {
+        return 0;
+    }
+    data_length++;
+
+    uint8_t bitmap[4] = { 0, };
+    uint8_t bitmap_len = 1;
+    if (got_a) {
+        bitmap[0] = 0x40;               /* type 1: A */
+    }
+    if (got_aaaa) {
+        bitmap[3] = 0x08;               /* type 28: AAAA */
+        bitmap_len = 4;
+    }
+    if ((*index + 2 + bitmap_len) >= MDNS_MAX_PACKET_SIZE) {
+        return 0;
+    }
+    _mdns_append_u8(packet, index, 0);  /* bitmap window block 0 (types 0-255) */
+    _mdns_append_u8(packet, index, bitmap_len);
+    memcpy(packet + *index, bitmap, bitmap_len);
+    *index += bitmap_len;
+    data_length += 2 + bitmap_len;
+
+    _mdns_set_u16(packet, data_len_location, data_length);
+    record_length += data_length;
+    return record_length;
+}
+
 #if CONFIG_LWIP_IPV6
 /**
  * @brief  appends AAAA record to a packet, incrementing the index
@@ -1100,14 +1185,17 @@ static uint8_t _mdns_append_answer(uint8_t * packet, uint16_t * index, mdns_out_
     else if (answer->type == MDNS_TYPE_AAAA) {
         if (answer->host == &_mdns_self_host) {
             struct esp_ip6_addr if_ip6;
-            if (!_mdns_server->interfaces[tcpip_if].pcbs[MDNS_IP_PROTOCOL_V6].pcb && _mdns_server->interfaces[tcpip_if].pcbs[MDNS_IP_PROTOCOL_V6].state != PCB_DUP) {
-                return 0;
-            }
-            if (esp_netif_get_ip6_linklocal(_mdns_get_esp_netif(tcpip_if), &if_ip6)) {
-                return 0;
-            }
-            if (_ipv6_address_is_zero(if_ip6)) {
-                return 0;
+            if ((!_mdns_server->interfaces[tcpip_if].pcbs[MDNS_IP_PROTOCOL_V6].pcb && _mdns_server->interfaces[tcpip_if].pcbs[MDNS_IP_PROTOCOL_V6].state != PCB_DUP)
+                || esp_netif_get_ip6_linklocal(_mdns_get_esp_netif(tcpip_if), &if_ip6)
+                || _ipv6_address_is_zero(if_ip6)) {
+                /* We own the name but have no AAAA record on this interface. Reply with an NSEC
+                 * record listing the types we do have, so the querier learns AAAA is absent
+                 * immediately instead of waiting for its query to time out, see RFC 6762 section 6.1 */
+                if (answer->bye) {
+                    return 0;
+                }
+                bool got_a = _mdns_server->interfaces[tcpip_if].pcbs[MDNS_IP_PROTOCOL_V4].pcb || _mdns_server->interfaces[tcpip_if].pcbs[MDNS_IP_PROTOCOL_V4].state == PCB_DUP;
+                return _mdns_append_host_nsec_record(packet, index, _mdns_server->hostname, got_a, false, answer->flush) > 0;
             }
             if (_mdns_append_aaaa_record(packet, index, _mdns_server->hostname, (uint8_t*)if_ip6.addr, answer->flush, answer->bye) <= 0) {
                 return 0;
